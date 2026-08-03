@@ -1,0 +1,191 @@
+// Canonical storage model. See DESIGN.md §4 and ADR-002, ADR-004, ADR-007, ADR-010, ADR-016.
+//
+// Under ADR-003 (cache-through proxy) the read path does NOT query `Comment`; the thread a
+// client receives is assembled from the platform payload by the adapter mapper (ADR-013).
+// `Comment` therefore holds only the rows we have interacted with: our own replies, plus the
+// minimal parent rows materialised to anchor them. The shape is nonetheless the shape a full
+// mirror would need, which is what makes ADR-003's migration a change of writer rather than a
+// schema rewrite.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  LINKEDIN
+  X
+  FACEBOOK
+  INSTAGRAM
+}
+
+enum PublicationState {
+  SCHEDULED
+  PUBLISHED
+  FAILED
+}
+
+/// Only ever set on an OwnReply — a Comment this system authored (ADR-006).
+enum DeliveryState {
+  PENDING
+  SENT
+  FAILED
+  UNKNOWN
+}
+
+/// The tenant. Assumed to exist already (A9); modelled here only so the FKs are real.
+model Workspace {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now())
+
+  connectedAccounts ConnectedAccount[]
+  posts             Post[]
+  publications      PostPublication[]
+  comments          Comment[]
+}
+
+/// One authorised social identity on one platform. Holds the OAuth token (A3: acquisition and
+/// refresh are owned elsewhere in the product) and is the unit of rate limiting and of
+/// idempotency-key uniqueness (ADR-007).
+model ConnectedAccount {
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @db.Uuid
+  platform       Platform
+  platformUserId String
+  platformHandle String?
+  accessToken    String
+  createdAt      DateTime @default(now())
+
+  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  publications PostPublication[]
+  ownReplies   Comment[]
+
+  // One identity per platform per workspace. Two brand accounts on the same platform are two rows,
+  // which is precisely the case ADR-002 rejects `Comment.postId + platform` for being unable to model.
+  @@unique([workspaceId, platform, platformUserId])
+  @@index([workspaceId])
+}
+
+/// Content authored in the scheduling product. Platform-agnostic; has no comment stream of its own.
+model Post {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @db.Uuid
+  body        String
+  createdAt   DateTime @default(now())
+
+  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  publications PostPublication[]
+}
+
+/// The result of publishing one Post to one ConnectedAccount. THE parent of a comment stream
+/// (ADR-002): it is the only entity that owns a platform-native post ID, a token, and a
+/// rate-limit budget simultaneously.
+model PostPublication {
+  id                 String           @id @default(uuid()) @db.Uuid
+  workspaceId        String           @db.Uuid
+  postId             String           @db.Uuid
+  connectedAccountId String           @db.Uuid
+  platform           Platform
+  platformPostId     String
+  state              PublicationState
+  publishedAt        DateTime?
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  post             Post             @relation(fields: [postId], references: [id], onDelete: Cascade)
+  connectedAccount ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+  comments         Comment[]
+
+  // The same post published twice to the same account would be two publications with the same
+  // platform post ID, which is not a state the publishing pipeline can produce.
+  @@unique([connectedAccountId, platformPostId])
+  // Every read is `findPublication(scope, id)`; the workspace column leads so the tenancy
+  // predicate (ADR-012) is index-satisfied rather than a post-filter.
+  @@index([workspaceId, postId])
+}
+
+model Comment {
+  id          String @id @default(uuid()) @db.Uuid
+  workspaceId String @db.Uuid
+
+  publicationId String @db.Uuid
+
+  /// Null for an OwnReply that has not been assigned an ID by the platform yet — i.e. one in
+  /// deliveryState PENDING or UNKNOWN (ADR-006). Non-null for everything else.
+  platformCommentId String?
+
+  // Adjacency list with denormalised ancestry (ADR-004). `rootId` is null on a root comment.
+  // Justified by the write path — ADR-006 commits the row before the platform call, so nothing
+  // later can backfill its position — and by the mirror, if ADR-003 is revisited.
+  parentId String? @db.Uuid
+  rootId   String? @db.Uuid
+  depth    Int     @default(0)
+
+  /// The root's *platform* ID, denormalised alongside `rootId`. Under the proxy strategy we
+  /// frequently hold a reply whose root has never been persisted, so the FK is null while the
+  /// ancestry is still known. Without this column, resolving the root of one of our own replies
+  /// would need a platform round trip.
+  rootPlatformCommentId String?
+
+  /// Nullable, and the nullability is the interesting part: a parent row materialised from a
+  /// comment reference (ADR-014) is known only by its platform ID, depth and author handle — we
+  /// have never fetched it. The same applies to an OwnReply in PENDING, which has no platform
+  /// timestamp yet. These fill in if a mirror ever ingests the thread.
+  body String?
+
+  // Author identity is a denormalised snapshot taken at fetch time; there is no author table and
+  // no join to our users (ADR-010). `authorHandle` is nullable because not every platform exposes
+  // a stable handle — ADR-009's mention degrades to no prefix when it is absent.
+  authorPlatformId  String?
+  authorHandle      String?
+  authorDisplayName String?
+  authorAvatarUrl   String?
+  isOwnedByUs       Boolean @default(false)
+
+  platformCreatedAt DateTime?
+
+  /// Mapper-curated native fields (ADR-016). Never serialised into an API response — it is absent
+  /// from the response DTO types, so leaking it is a compile error rather than a review catch.
+  platformMetadata Json?
+
+  // --- OwnReply-only columns. All null on a comment authored by a third party. -----------------
+  connectedAccountId String?        @db.Uuid
+  deliveryState      DeliveryState?
+  idempotencyKey     String?
+  failureCode        String?
+
+  /// ADR-009's disclosure, persisted rather than recomputed: the delivery-status resource has to
+  /// report what happened to *this* reply, and the requested parent is not recoverable afterwards.
+  threadCollapsed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace        Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  publication      PostPublication   @relation(fields: [publicationId], references: [id], onDelete: Cascade)
+  connectedAccount ConnectedAccount? @relation(fields: [connectedAccountId], references: [id])
+  parent           Comment?          @relation("CommentThread", fields: [parentId], references: [id])
+  children         Comment[]         @relation("CommentThread")
+
+  // Ingestion idempotency (DESIGN.md §4). Postgres treats NULLs as distinct, so the many
+  // own-replies awaiting a platform ID do not collide. This is what lets ADR-014 resolve a
+  // platform-keyed comment reference, and what would let a future mirror re-ingest without
+  // duplicating.
+  @@unique([publicationId, platformCommentId])
+
+  // The mirror's page query — roots by time, then `WHERE rootId IN (...)` — in one index.
+  @@index([publicationId, rootId, platformCreatedAt])
+  // The reconciler's scan (ADR-006): own replies stuck in UNKNOWN for one account.
+  @@index([connectedAccountId, deliveryState])
+
+  // NOTE: the idempotency constraint is a PARTIAL unique index
+  //   UNIQUE (connectedAccountId, idempotencyKey) WHERE idempotencyKey IS NOT NULL
+  // and lives in prisma/partial-indexes.sql because Prisma's schema language cannot express a
+  // WHERE clause on an index. Its partiality is what ADR-015's key release depends on. See
+  // DESIGN.md §4 for why the partial form is the intended one even though a plain unique index
+  // would behave identically on PostgreSQL.
+}
