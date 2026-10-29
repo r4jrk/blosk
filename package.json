@@ -38,5 +38,8 @@
     "roots": [
       "<rootDir>/test"
     ]
+  },
+  "overrides": {
+    "js-yaml": "^5.4.1"
   }
 }
