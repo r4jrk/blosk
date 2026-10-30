@@ -31,8 +31,8 @@ export const xUserSchema = z.object({
 
 export const xConversationPageSchema = z.object({
   data: z.array(xTweetSchema).default([]),
-  includes: z.object({ users: z.array(xUserSchema).default([]) }).default({}),
-  meta: z.object({ next_token: z.string().nullish() }).default({}),
+  includes: z.object({ users: z.array(xUserSchema).default([]) }).prefault({}),
+  meta: z.object({ next_token: z.string().nullish() }).prefault({}),
 });
 
 export const xCreatedTweetSchema = z.object({
